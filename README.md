@@ -35,8 +35,8 @@ _Это мой первый публичный репозиторий, поэт�
 ### 1. Клонирование репозитория
 
 ```bash
-git clone https://github.com/gniloeapple/Telegram-Support-Bot.git
-cd Telegram-Support-Bot
+git clone https://github.com/gniloeapple/telegram-support-bot.git
+cd telegram-support-bot
 ```
 
 ### 2. Создание виртуального окружения (рекомендуется)
