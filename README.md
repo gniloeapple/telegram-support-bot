@@ -59,16 +59,6 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Настройка окружения
-
-Переименуйте файл `.env.example` в `.env` (или создайте новый) и откройте его для редактирования:
-
-```env
-TELEGRAM_TOKEN=ваш_токен_бота
-SUPPORT_CHAT_ID=-100xxxxxxxxxx
-SUPPORT_TOPIC_ID=XXX
-```
-
 **Где взять данные:**
 * **TELEGRAM_TOKEN**: Напишите [@BotFather](https://t.me/BotFather), создайте нового бота и скопируйте выданный токен.
 * **SUPPORT_CHAT_ID**:
