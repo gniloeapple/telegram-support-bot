@@ -125,4 +125,3 @@ python bot.py
 ## 📞 Поддержка
 
 * **GitHub Issues** — баги и предложения
-* **Telegram** — [@gniloeapple](https://t.me/gniloeapple)
