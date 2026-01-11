@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
 
+# Общий топик (используется в режиме single_topic)
 raw_topic_id = os.getenv("SUPPORT_TOPIC_ID")
 SUPPORT_TOPIC_ID = int(raw_topic_id) if raw_topic_id and raw_topic_id.strip().isdigit() else None
 
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     first_name     TEXT,
     status         TEXT NOT NULL DEFAULT 'open',
     created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    updated_at     TEXT NOT NULL,
+    topic_id       INTEGER
 )
 """
 )
@@ -91,6 +93,20 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 """
 )
 
+# ---- МИГРАЦИЯ: Добавляем topic_id, если его нет ----
+def add_column_if_not_exists(table_name: str, column_name: str, column_type: str):
+    """Добавляет колонку в таблицу, если её ещё нет"""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    if column_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+        logger.info(f"Добавлена колонка {column_name} в таблицу {table_name}")
+    else:
+        logger.info(f"Колонка {column_name} уже существует в таблице {table_name}")
+
+add_column_if_not_exists("tickets", "topic_id", "INTEGER")
+
 conn.commit()
 
 
@@ -109,6 +125,16 @@ def set_setting(key: str, value: str):
         (key, value),
     )
     conn.commit()
+
+
+def get_topic_mode() -> str:
+    """Возвращает режим топиков: 'per_user' или 'single_topic'"""
+    return get_setting("topic_mode", "per_user")
+
+
+def set_topic_mode(mode: str):
+    """Устанавливает режим топиков"""
+    set_setting("topic_mode", mode)
 
 
 # Дефолтные тексты
@@ -172,9 +198,10 @@ def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
 
 # ----------------- Работа с БД / тикетами -----------------
 def get_open_ticket(user_chat_id: int):
+    """Возвращает ID и topic_id открытого тикета пользователя"""
     cursor.execute(
         """
-        SELECT id FROM tickets
+        SELECT id, topic_id FROM tickets
         WHERE user_chat_id = ? AND status = 'open'
         ORDER BY id DESC
         LIMIT 1
@@ -182,23 +209,67 @@ def get_open_ticket(user_chat_id: int):
         (user_chat_id,),
     )
     row = cursor.fetchone()
-    return row[0] if row else None
+    return row if row else None
 
 
-def create_ticket(user_chat_id: int, username: str = None, first_name: str = None) -> int:
+async def create_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, username: str = None, first_name: str = None) -> tuple:
+    """Создает тикет и топик в форуме (если режим per_user)"""
     now = datetime.now(timezone.utc).isoformat()
+    topic_mode = get_topic_mode()
+    
+    topic_id = None
+    
+    # Создаем отдельный топик только в режиме per_user
+    if topic_mode == "per_user":
+        display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
+        topic_name = f"🟢 {display_name}"
+        
+        try:
+            forum_topic = await context.bot.create_forum_topic(
+                chat_id=SUPPORT_CHAT_ID,
+                name=topic_name[:128]
+            )
+            topic_id = forum_topic.message_thread_id
+            logger.info(f"Создан топик {topic_id} для пользователя {user_chat_id}")
+        except Exception as e:
+            logger.error(f"Ошибка создания топика: {e}")
+    
+    # Сохраняем тикет с topic_id
     cursor.execute(
         """
-        INSERT INTO tickets (user_chat_id, username, first_name, status, created_at, updated_at)
-        VALUES (?, ?, ?, 'open', ?, ?)
+        INSERT INTO tickets (user_chat_id, username, first_name, status, created_at, updated_at, topic_id)
+        VALUES (?, ?, ?, 'open', ?, ?, ?)
         """,
-        (user_chat_id, username, first_name, now, now),
+        (user_chat_id, username, first_name, now, now, topic_id),
     )
     conn.commit()
-    return cursor.lastrowid
+    ticket_id = cursor.lastrowid
+    
+    # Отправляем информацию о пользователе в топик (только для per_user режима)
+    if topic_mode == "per_user" and topic_id:
+        username_display = f"@{username}" if username else "Не указан"
+        user_info = (
+            f"👤 <b>Информация о пользователе</b>\n\n"
+            f"🆔 ID: <code>{user_chat_id}</code>\n"
+            f"👤 Имя: {first_name or 'Не указано'}\n"
+            f"📱 Username: {username_display}\n"
+            f"🎫 Тикет: #{ticket_id}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=SUPPORT_CHAT_ID,
+                message_thread_id=topic_id,
+                text=user_info,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки информации о пользователе: {e}")
+    
+    return ticket_id, topic_id
 
 
 def update_ticket_status(ticket_id: int, status: str):
+    """Обновляет статус тикета"""
     now = datetime.now(timezone.utc).isoformat()
     cursor.execute(
         """
@@ -209,6 +280,40 @@ def update_ticket_status(ticket_id: int, status: str):
         (status, now, ticket_id),
     )
     conn.commit()
+
+
+async def update_topic_status(context: ContextTypes.DEFAULT_TYPE, ticket_id: int, status: str):
+    """Обновляет название топика при изменении статуса (только для per_user режима)"""
+    topic_mode = get_topic_mode()
+    if topic_mode != "per_user":
+        return
+    
+    cursor.execute(
+        """
+        SELECT topic_id, username, first_name, user_chat_id FROM tickets
+        WHERE id = ?
+        """,
+        (ticket_id,),
+    )
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return
+    
+    topic_id, username, first_name, user_chat_id = row
+    
+    status_emoji = "🔴" if status == "closed" else "🟢"
+    display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
+    topic_name = f"{status_emoji} {display_name}"
+    
+    try:
+        await context.bot.edit_forum_topic(
+            chat_id=SUPPORT_CHAT_ID,
+            message_thread_id=topic_id,
+            name=topic_name[:128]
+        )
+        logger.info(f"Обновлено название топика {topic_id} на '{topic_name}'")
+    except Exception as e:
+        logger.error(f"Ошибка обновления названия топика: {e}")
 
 
 def get_ticket_by_support_message(support_message_id: int):
@@ -274,6 +379,19 @@ def get_user_chat_id_by_ticket(ticket_id: int):
     return row[0] if row else None
 
 
+def get_topic_id_by_ticket(ticket_id: int):
+    """Возвращает topic_id по ID тикета"""
+    cursor.execute(
+        """
+        SELECT topic_id FROM tickets
+        WHERE id = ?
+        """,
+        (ticket_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 # ----------------- Хендлеры пользователя -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
@@ -300,15 +418,23 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_user_blocked(user_chat_id):
         return
 
-    ticket_id = get_open_ticket(user_chat_id)
+    ticket_data = get_open_ticket(user_chat_id)
     new_ticket = False
-    if ticket_id is None:
-        ticket_id = create_ticket(user_chat_id, user.username, user.first_name)
+    
+    if ticket_data is None:
+        ticket_id, topic_id = await create_ticket(context, user_chat_id, user.username, user.first_name)
         new_ticket = True
+        await message.reply_text(
+            f"✅ Ваш тикет #{ticket_id} создан. Оператор поддержки скоро ответит."
+        )
+    else:
+        ticket_id, topic_id = ticket_data
 
     username = f"@{user.username}" if user.username else "Не указан"
     
-    if new_ticket:
+    # В режиме single_topic показываем полную информацию о тикете
+    topic_mode = get_topic_mode()
+    if topic_mode == "single_topic" and new_ticket:
         header = (
             f"🎫 НОВЫЙ ТИКЕТ\n\n"
             f"🆔 Тикет: {ticket_id}\n"
@@ -317,18 +443,18 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📱 Username: {username}"
         )
     else:
-        header = (
-            f"💬 Тикет #{ticket_id}\n"
-            f"👤 {user.first_name or 'Не указано'} ({username}):"
-        )
+        header = f"💬 {user.first_name or 'Не указано'} ({username}):"
 
-    if new_ticket:
-        await message.reply_text(
-            f"✅ Ваш тикет #{ticket_id} создан. Оператор поддержки скоро ответит."
-        )
-
-    send_kwargs = {"chat_id": SUPPORT_CHAT_ID}
-    if SUPPORT_TOPIC_ID:
+    send_kwargs = {
+        "chat_id": SUPPORT_CHAT_ID,
+    }
+    
+    # Определяем куда отправлять сообщение
+    if topic_mode == "per_user" and topic_id:
+        # Режим отдельных топиков - используем topic_id из тикета
+        send_kwargs["message_thread_id"] = topic_id
+    elif topic_mode == "single_topic" and SUPPORT_TOPIC_ID:
+        # Режим общего топика - используем SUPPORT_TOPIC_ID
         send_kwargs["message_thread_id"] = SUPPORT_TOPIC_ID
 
     keyboard = [
@@ -404,8 +530,6 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if message.chat_id != SUPPORT_CHAT_ID:
         return
-    if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
-        return
     if not message.reply_to_message:
         return
 
@@ -473,9 +597,13 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return
     
+    topic_mode = get_topic_mode()
+    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
+    
     keyboard = [
         [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
         [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -483,7 +611,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ Управление ботом",
         reply_markup=reply_markup
     )
-    # Сохраняем ID сообщения с админ-панелью
     context.user_data['admin_menu_message_id'] = msg.message_id
     context.user_data['admin_menu_chat_id'] = msg.chat_id
 
@@ -497,13 +624,16 @@ async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return ConversationHandler.END
     
+    topic_mode = get_topic_mode()
+    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
+    
     keyboard = [
         [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
         [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Редактируем исходное сообщение с админ-панелью
     menu_msg_id = context.user_data.get('admin_menu_message_id')
     menu_chat_id = context.user_data.get('admin_menu_chat_id')
     
@@ -519,7 +649,6 @@ async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Ошибка редактирования меню: {e}")
     
-    # Удаляем сообщение с кнопкой "В меню"
     back_button_msg_id = context.user_data.get('back_button_message_id')
     if back_button_msg_id and menu_chat_id:
         try:
@@ -542,11 +671,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(user_id):
         return
     
-    # Сохраняем ID сообщения с кнопками админ-панели
     context.user_data['admin_menu_message_id'] = query.message.message_id
     context.user_data['admin_menu_chat_id'] = query.message.chat_id
     
-    # Кнопка для возврата в меню
     back_keyboard = [
         [InlineKeyboardButton("◀️ В меню", callback_data="admin_back_to_menu")]
     ]
@@ -560,7 +687,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
             reply_markup=back_markup
         )
-        # Сохраняем ID сообщения с кнопкой "В меню"
         context.user_data['back_button_message_id'] = msg.message_id
         return WAITING_GREETING
     
@@ -572,9 +698,28 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
             reply_markup=back_markup
         )
-        # Сохраняем ID сообщения с кнопкой "В меню"
         context.user_data['back_button_message_id'] = msg.message_id
         return WAITING_HELP
+    
+    elif query.data == "admin_toggle_mode":
+        # Переключаем режим топиков
+        current_mode = get_topic_mode()
+        new_mode = "single_topic" if current_mode == "per_user" else "per_user"
+        set_topic_mode(new_mode)
+        
+        mode_text = "📁 Отдельный топик для каждого пользователя" if new_mode == "per_user" else "📂 Общий топик для всех"
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
+            [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+            [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Ошибка обновления кнопок: {e}")
 
 
 async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,10 +733,13 @@ async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("✅ Приветственное сообщение успешно обновлено!")
     
-    # Показываем обновленное меню, редактируя исходное сообщение
+    topic_mode = get_topic_mode()
+    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
+    
     keyboard = [
         [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
         [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -610,7 +758,6 @@ async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Ошибка редактирования меню: {e}")
     
-    # Удаляем сообщение с кнопкой "В меню"
     back_button_msg_id = context.user_data.get('back_button_message_id')
     if back_button_msg_id and menu_chat_id:
         try:
@@ -635,10 +782,13 @@ async def save_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("✅ Сообщение помощи успешно обновлено!")
     
-    # Показываем обновленное меню, редактируя исходное сообщение
+    topic_mode = get_topic_mode()
+    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
+    
     keyboard = [
         [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
         [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -657,7 +807,6 @@ async def save_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Ошибка редактирования меню: {e}")
     
-    # Удаляем сообщение с кнопкой "В меню"
     back_button_msg_id = context.user_data.get('back_button_message_id')
     if back_button_msg_id and menu_chat_id:
         try:
@@ -675,6 +824,7 @@ async def cancel_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена операции редактирования"""
     await update.message.reply_text("❌ Операция отменена.")
     return ConversationHandler.END
+
 
 # ----------------- Обработка кнопок -----------------
 async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,13 +864,12 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         text=text
     )
 
+
 # --------- Команды для операторов в чате поддержки ---------
 async def open_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
         return
 
     rows = get_all_open_tickets()
@@ -746,11 +895,10 @@ async def open_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join(lines)
     await message.reply_text(text)
 
+
 async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
         return
     if not message.reply_to_message:
         await message.reply_text("Команду /close нужно вызывать ответом на сообщение тикета.")
@@ -764,6 +912,7 @@ async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = get_user_chat_id_by_ticket(ticket_id)
     
     update_ticket_status(ticket_id, "closed")
+    await update_topic_status(context, ticket_id, "closed")
     await message.reply_text(f"✅ Тикет #{ticket_id} закрыт.")
     
     if user_chat_id:
@@ -780,8 +929,6 @@ async def reopen_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message.chat_id != SUPPORT_CHAT_ID:
         return
-    if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
-        return
     if not message.reply_to_message:
         await message.reply_text("Команду /reopen нужно вызывать ответом на сообщение тикета.")
         return
@@ -792,14 +939,13 @@ async def reopen_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     update_ticket_status(ticket_id, "open")
+    await update_topic_status(context, ticket_id, "open")
     await message.reply_text(f"♻️ Тикет #{ticket_id} снова открыт.")
 
 
 async def ticket_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
         return
     if not message.reply_to_message:
         await message.reply_text("Команду /ticket нужно вызывать ответом на сообщение тикета.")
@@ -882,6 +1028,9 @@ def main():
     # Conversation handler для админки
     application.add_handler(admin_conv_handler)
 
+    # Обработчик кнопки переключения режима топиков
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_toggle_mode$"))
+    
     # Обработчик нажатия на кнопку Block/Unblock
     application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_"))
 
