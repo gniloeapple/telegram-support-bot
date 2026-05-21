@@ -244,32 +244,6 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 caption=f"{header}\n\n{cap}" if cap else header,
                 **send_kwargs,
             )
-        elif msg.video_note:
-            # video_note не поддерживает caption — отправляем отдельным сообщением
-            await context.bot.send_message(text=header, **send_kwargs)
-            sent_message = await context.bot.send_video_note(
-                video_note=msg.video_note.file_id, **{k: v for k, v in send_kwargs.items() if k != "reply_markup"}
-            )
-        elif msg.sticker:
-            await context.bot.send_message(text=header, **send_kwargs)
-            sent_message = await context.bot.send_sticker(
-                sticker=msg.sticker.file_id, **{k: v for k, v in send_kwargs.items() if k != "reply_markup"}
-            )
-        elif msg.location:
-            await context.bot.send_message(text=header, **send_kwargs)
-            sent_message = await context.bot.send_location(
-                latitude=msg.location.latitude,
-                longitude=msg.location.longitude,
-                **{k: v for k, v in send_kwargs.items() if k != "reply_markup"},
-            )
-        elif msg.contact:
-            await context.bot.send_message(text=header, **send_kwargs)
-            sent_message = await context.bot.send_contact(
-                phone_number=msg.contact.phone_number,
-                first_name=msg.contact.first_name,
-                last_name=msg.contact.last_name or "",
-                **{k: v for k, v in send_kwargs.items() if k != "reply_markup"},
-            )
         elif msg.text:
             sent_message = await context.bot.send_message(
                 text=f"{header}\n\n{msg.text}", **send_kwargs
@@ -321,10 +295,6 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_audio(
                 chat_id=user_chat_id, audio=message.audio.file_id, caption=message.caption or ""
             )
-        elif message.sticker:
-            await context.bot.send_sticker(chat_id=user_chat_id, sticker=message.sticker.file_id)
-        elif message.video_note:
-            await context.bot.send_video_note(chat_id=user_chat_id, video_note=message.video_note.file_id)
         elif message.text:
             await context.bot.send_message(chat_id=user_chat_id, text=message.text)
     except Exception as e:
