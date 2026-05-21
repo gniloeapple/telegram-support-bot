@@ -1,3 +1,4 @@
 python-telegram-bot==20.8
-python-dotenv
-pytz
+python-dotenv==1.0.1
+pytz==2024.1
+aiosqlite==0.20.0
